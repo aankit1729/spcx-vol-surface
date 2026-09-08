@@ -1,1 +1,18 @@
-
+name: daily option-chain snapshot
+on:
+  schedule:
+    - cron: "15 21 * * 1-5"   # 21:15 UTC = after US close, Mon-Fri
+  workflow_dispatch:
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install -e .
+      - run: python scripts/snapshot.py SPCX SPY QQQ
+      - run: |
+          git config user.name "snapshot-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add data/raw && git commit -m "snapshot $(date -u +%F)" && git push
