@@ -142,7 +142,7 @@ def subsample_surface(chain, max_expiries=10, k_max=0.6, min_days=5, max_days=40
 
 
 def calibrate(chain, S, r, q, p0: HestonParams | None = None, weights=None,
-              max_nfev=200, verbose=False, thin=True) -> HestonParams:
+              max_nfev=200, verbose=False, thin=True, multistart=True) -> HestonParams:
     """Calibrate to a DataFrame with columns [T, K, iv, cp].
 
     Residuals are price errors divided by market vega, which approximates the
@@ -152,7 +152,9 @@ def calibrate(chain, S, r, q, p0: HestonParams | None = None, weights=None,
     """
     if thin:
         chain = subsample_surface(chain, S=S, r=r, q=q)
-    p0 = p0 or HestonParams(v0=0.09, kappa=2.0, theta=0.09, xi=0.5, rho=-0.5)
+    if p0 is None:
+        atm = float(chain.loc[chain["k"].abs().idxmin(), "iv"]) if "k" in chain else 0.3
+        p0 = HestonParams(v0=atm**2, kappa=2.0, theta=atm**2, xi=0.6 * atm, rho=-0.6)
 
     # market prices and vegas, computed once
     T_a = chain["T"].values
@@ -178,14 +180,33 @@ def calibrate(chain, S, r, q, p0: HestonParams | None = None, weights=None,
             print(f"    eval {n_eval[0]:4d}  rmse {np.sqrt(np.mean(res**2))*1e4:7.1f} bp")
         return res
 
-    lb = [1e-4, 1e-2, 1e-4, 1e-2, -0.95]
-    ub = [4.0, 20.0, 4.0, 5.0, 0.95]
-    x0 = np.clip([p0.v0, p0.kappa, p0.theta, p0.xi, p0.rho], lb, ub)
-    sol = least_squares(resid, x0, bounds=(lb, ub), xtol=1e-8, ftol=1e-10,
-                        diff_step=1e-4, max_nfev=max_nfev)
+    # Bounds kept economically plausible. A fit that pins xi or kappa at a bound is
+    # not converged, it is degenerate, and should be reported as such rather than used.
+    lb = [1e-4, 0.05, 1e-4, 0.05, -0.95]
+    ub = [2.0, 10.0, 2.0, 3.0, 0.10]
+
+    best = None
+    starts = [p0] if not multistart else [
+        p0,
+        HestonParams(p0.v0, 1.0, p0.v0, 0.8, -0.7),
+        HestonParams(p0.v0, 4.0, p0.v0 * 1.5, 1.5, -0.5),
+        HestonParams(p0.v0, 0.5, p0.v0 * 0.7, 0.4, -0.85),
+    ]
+    for st in starts:
+        x0 = np.clip([st.v0, st.kappa, st.theta, st.xi, st.rho], lb, ub)
+        sol = least_squares(resid, x0, bounds=(lb, ub), xtol=1e-10, ftol=1e-12,
+                            diff_step=1e-4, max_nfev=max_nfev)
+        if best is None or sol.cost < best.cost:
+            best = sol
+
+    fit = HestonParams(*best.x)
+    at_bound = [n for n, v, l, u in zip(("v0", "kappa", "theta", "xi", "rho"), best.x, lb, ub)
+                if abs(v - l) < 1e-3 * max(abs(l), 1) or abs(v - u) < 1e-3 * max(abs(u), 1)]
     if verbose:
-        print(f"    done: {n_eval[0]} evals, status {sol.status} ({sol.message.strip()})")
-    return HestonParams(*sol.x)
+        print(f"    done: {n_eval[0]} evals over {len(starts)} start(s), status {best.status}")
+        if at_bound:
+            print(f"    WARNING: parameters pinned at bounds: {at_bound} -> fit is degenerate")
+    return fit
 
 
 def surface_rmse_bp(chain, S, r, q, p: HestonParams) -> float:
