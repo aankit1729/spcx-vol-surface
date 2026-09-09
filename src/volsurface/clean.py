@@ -70,13 +70,19 @@ def clean_chain(raw: pd.DataFrame, r: float, q: float = 0.0,
     out = []
     for T, g in df.groupby("T"):
         F = _implied_forward(g, r, T)
-        g = g.assign(F=F, k=np.log(g["strike"] / F))
+        # Black-76: work off the implied forward, never the raw spot. Using S with
+        # q=0 assumes F = S*exp(rT), which is wrong by the dividend yield and by any
+        # move between the 16:00 stock close and the 16:15 options close. Either
+        # error shows up as a put/call vol gap right at the money.
+        S_fwd = F * np.exp(-r * T)
+        g = g.assign(F=F, S_fwd=S_fwd, k=np.log(g["strike"] / F),
+                     q_implied=r - np.log(F / g["spot"]) / T)
         otm = ((g["cpi"] == 1) & (g["strike"] >= F)) | ((g["cpi"] == -1) & (g["strike"] < F))
         g = g[otm]
         if g.empty:
             continue
-        g = g.assign(iv=bs.implied_vol(g["mid"].values, g["spot"].values, g["strike"].values,
-                                       T, r, q, g["cpi"].values))
+        g = g.assign(iv=bs.implied_vol(g["mid"].values, S_fwd, g["strike"].values,
+                                       T, r, 0.0, g["cpi"].values))
         out.append(g)
     n = len(df)
     df = pd.concat(out, ignore_index=True) if out else df.iloc[:0].assign(F=np.nan, k=np.nan, iv=np.nan)
@@ -94,7 +100,7 @@ def clean_chain(raw: pd.DataFrame, r: float, q: float = 0.0,
     n = len(df); df = df[df["z"].abs() <= max_z]; note("beyond wing cutoff", n)
 
     # vega is the natural fitting weight: it is the sensitivity the fit should care about
-    df["vega"] = bs.vega(df["spot"].values, df["strike"].values, df["T"].values, r, q, df["iv"].values)
+    df["vega"] = bs.vega(df["S_fwd"].values, df["strike"].values, df["T"].values, r, 0.0, df["iv"].values)
     df["rel_spread"] = (df["ask"] - df["bid"]) / df["mid"]
     df["fit_weight"] = df["vega"] / np.maximum(df["rel_spread"], 0.005)
 
