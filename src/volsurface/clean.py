@@ -84,7 +84,13 @@ def clean_chain(raw: pd.DataFrame, r: float, q: float = 0.0,
 
     n = len(df); df = df.dropna(subset=["iv"]); note("IV inversion failed", n)
 
-    df["z"] = df["k"] / (df["iv"] * np.sqrt(df["T"]))
+    # Standardised moneyness, measured against the ATM vol of that expiry.
+    # Using each option's own IV is self-defeating: deep OTM puts have inflated
+    # IV, which sits in the denominator and lets exactly the worst quotes through.
+    atm = df.loc[df.groupby("T")["k"].transform(lambda x: x.abs() == x.abs().min())] \
+            .groupby("T")["iv"].first()
+    df["atm_iv"] = df["T"].map(atm)
+    df["z"] = df["k"] / (df["atm_iv"] * np.sqrt(df["T"]))
     n = len(df); df = df[df["z"].abs() <= max_z]; note("beyond wing cutoff", n)
 
     # vega is the natural fitting weight: it is the sensitivity the fit should care about
