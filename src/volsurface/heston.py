@@ -97,7 +97,13 @@ def price(S, K, T, r, q, p: HestonParams, cp=1, N=256, L=12.0):
     expo = np.exp(1j * np.outer(x, omega) - 1j * omega * a)  # (nK, N)
     call = K * np.exp(-r * T) * np.real(expo @ (phi * V))
 
-    cp = np.asarray(cp)
+        cp = np.atleast_1d(np.asarray(cp)).ravel()
+    if cp.size not in (1, K.size):
+        raise ValueError(
+            f"cp has {cp.size} entries but there are {K.size} strikes. "
+            "A common cause is a duplicated 'cp' column in the input DataFrame, "
+            "which makes df['cp'] return a 2-D frame instead of a vector."
+        )
     put = call - S * np.exp(-q * T) + K * np.exp(-r * T)
     out = np.where(cp == 1, call, put)
     return out if out.size > 1 else float(out[0])
