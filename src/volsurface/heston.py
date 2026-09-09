@@ -161,8 +161,14 @@ def calibrate(chain, S, r, q, p0: HestonParams | None = None, weights=None,
     K_a = chain["K"].values
     cp_a = chain["cp"].values
     iv_a = chain["iv"].values
-    px_mkt = bs.price(S, K_a, T_a, r, q, iv_a, cp_a)
-    vega_a = np.maximum(bs.vega(S, K_a, T_a, r, q, iv_a), 1e-4)
+    # If the chain carries an implied forward per expiry, price off it (Black-76
+    # style) so the model forward matches the market forward exactly.
+    if "F" in chain:
+        S_a = chain["F"].values * np.exp(-r * T_a); q_use = 0.0
+    else:
+        S_a = np.full(len(chain), S); q_use = q
+    px_mkt = bs.price(S_a, K_a, T_a, r, q_use, iv_a, cp_a)
+    vega_a = np.maximum(bs.vega(S_a, K_a, T_a, r, q_use, iv_a), 1e-4)
     wts = np.ones(len(chain)) if weights is None else np.asarray(weights, dtype=float)
     scale = np.sqrt(wts) / vega_a
 
@@ -173,7 +179,7 @@ def calibrate(chain, S, r, q, p0: HestonParams | None = None, weights=None,
         p = HestonParams(*x)
         out = np.empty_like(px_mkt)
         for T, idx in groups:
-            out[idx] = price(S, K_a[idx], T, r, q, p, cp=cp_a[idx])
+            out[idx] = price(S_a[idx[0]], K_a[idx], T, r, q_use, p, cp=cp_a[idx])
         n_eval[0] += 1
         res = (out - px_mkt) * scale
         if verbose and n_eval[0] % 25 == 0:
@@ -213,8 +219,12 @@ def surface_rmse_bp(chain, S, r, q, p: HestonParams) -> float:
     """Model-vs-market RMSE in implied-vol basis points (for reporting, not fitting)."""
     err = []
     for T, g in chain.groupby("T"):
-        px = price(S, g["K"].values, T, r, q, p, cp=g["cp"].values)
-        iv = bs.implied_vol(px, S, g["K"].values, T, r, q, g["cp"].values)
+        if "F" in g:
+            S_T, q_T = float(g["F"].iloc[0]) * np.exp(-r * T), 0.0
+        else:
+            S_T, q_T = S, q
+        px = price(S_T, g["K"].values, T, r, q_T, p, cp=g["cp"].values)
+        iv = bs.implied_vol(px, S_T, g["K"].values, T, r, q_T, g["cp"].values)
         err.append(iv - g["iv"].values)
     err = np.concatenate(err)
     return float(np.sqrt(np.nanmean(err**2)) * 1e4)
