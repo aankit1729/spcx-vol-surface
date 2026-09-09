@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
+import pandas as pd
 from scipy.optimize import least_squares
 
 from . import bs
@@ -97,7 +98,7 @@ def price(S, K, T, r, q, p: HestonParams, cp=1, N=256, L=12.0):
     expo = np.exp(1j * np.outer(x, omega) - 1j * omega * a)  # (nK, N)
     call = K * np.exp(-r * T) * np.real(expo @ (phi * V))
 
-        cp = np.atleast_1d(np.asarray(cp)).ravel()
+    cp = np.atleast_1d(np.asarray(cp)).ravel()
     if cp.size not in (1, K.size):
         raise ValueError(
             f"cp has {cp.size} entries but there are {K.size} strikes. "
@@ -109,34 +110,93 @@ def price(S, K, T, r, q, p: HestonParams, cp=1, N=256, L=12.0):
     return out if out.size > 1 else float(out[0])
 
 
-def calibrate(chain, S, r, q, p0: HestonParams | None = None, weights=None) -> HestonParams:
-    """Calibrate to a DataFrame with columns [T, K, iv, cp] by matching implied vols.
+def subsample_surface(chain, max_expiries=10, k_max=0.6, min_days=5, max_days=400,
+                      max_per_expiry=25, S=None, r=0.0, q=0.0):
+    """Thin a chain down to a calibration set.
 
-    Matching in vol space (not price) equalises the influence of cheap OTM
-    options versus expensive ITM ones.
+    Heston has five parameters; fitting them to 4,000 quotes is slow and mostly
+    redundant, since neighbouring strikes carry almost the same information.
+    Keeps liquid maturities, a sane moneyness band, and evenly spaced strikes.
     """
-    p0 = p0 or HestonParams(v0=0.09, kappa=2.0, theta=0.09, xi=0.5, rho=-0.5)
-    wts = np.ones(len(chain)) if weights is None else np.asarray(weights, dtype=float)
-    groups = [(T, g) for T, g in chain.groupby("T")]
+    df = chain.copy()
+    df = df[(df["T"] * 365 >= min_days) & (df["T"] * 365 <= max_days)]
+    if "k" not in df:
+        F = S * np.exp((r - q) * df["T"])
+        df["k"] = np.log(df["K"] / F)
+    df = df[df["k"].abs() <= k_max]
 
-    def unpack(x):
-        return HestonParams(*x)
+    expiries = np.sort(df["T"].unique())
+    if len(expiries) > max_expiries:
+        idx = np.unique(np.linspace(0, len(expiries) - 1, max_expiries).round().astype(int))
+        expiries = expiries[idx]
+    df = df[df["T"].isin(expiries)]
+
+    out = []
+    for T, g in df.groupby("T"):
+        g = g.sort_values("k")
+        if len(g) > max_per_expiry:
+            idx = np.unique(np.linspace(0, len(g) - 1, max_per_expiry).round().astype(int))
+            g = g.iloc[idx]
+        out.append(g)
+    return pd.concat(out, ignore_index=True)
+
+
+def calibrate(chain, S, r, q, p0: HestonParams | None = None, weights=None,
+              max_nfev=200, verbose=False, thin=True) -> HestonParams:
+    """Calibrate to a DataFrame with columns [T, K, iv, cp].
+
+    Residuals are price errors divided by market vega, which approximates the
+    implied-vol error to first order while keeping the objective smooth. Inverting
+    model prices to vols inside the loop is both slower and non-differentiable
+    wherever the inversion fails, which stalls the optimiser.
+    """
+    if thin:
+        chain = subsample_surface(chain, S=S, r=r, q=q)
+    p0 = p0 or HestonParams(v0=0.09, kappa=2.0, theta=0.09, xi=0.5, rho=-0.5)
+
+    # market prices and vegas, computed once
+    T_a = chain["T"].values
+    K_a = chain["K"].values
+    cp_a = chain["cp"].values
+    iv_a = chain["iv"].values
+    px_mkt = bs.price(S, K_a, T_a, r, q, iv_a, cp_a)
+    vega_a = np.maximum(bs.vega(S, K_a, T_a, r, q, iv_a), 1e-4)
+    wts = np.ones(len(chain)) if weights is None else np.asarray(weights, dtype=float)
+    scale = np.sqrt(wts) / vega_a
+
+    groups = [(T, np.where(T_a == T)[0]) for T in np.sort(chain["T"].unique())]
+    n_eval = [0]
 
     def resid(x):
-        p = unpack(x)
-        res = []
-        for T, g in groups:
-            model_px = price(S, g["K"].values, T, r, q, p, cp=g["cp"].values)
-            model_iv = bs.implied_vol(model_px, S, g["K"].values, T, r, q, g["cp"].values)
-            model_iv = np.where(np.isfinite(model_iv), model_iv, 5.0)
-            res.append(model_iv - g["iv"].values)
-        return np.concatenate(res) * np.sqrt(wts)
+        p = HestonParams(*x)
+        out = np.empty_like(px_mkt)
+        for T, idx in groups:
+            out[idx] = price(S, K_a[idx], T, r, q, p, cp=cp_a[idx])
+        n_eval[0] += 1
+        res = (out - px_mkt) * scale
+        if verbose and n_eval[0] % 25 == 0:
+            print(f"    eval {n_eval[0]:4d}  rmse {np.sqrt(np.mean(res**2))*1e4:7.1f} bp")
+        return res
 
-    lb = [1e-4, 1e-3, 1e-4, 1e-3, -0.999]
-    ub = [4.0, 20.0, 4.0, 5.0, 0.999]
-    sol = least_squares(resid, p0.as_array() if hasattr(p0, "as_array") else
-                        [p0.v0, p0.kappa, p0.theta, p0.xi, p0.rho], bounds=(lb, ub), xtol=1e-8)
-    return unpack(sol.x)
+    lb = [1e-4, 1e-2, 1e-4, 1e-2, -0.95]
+    ub = [4.0, 20.0, 4.0, 5.0, 0.95]
+    x0 = np.clip([p0.v0, p0.kappa, p0.theta, p0.xi, p0.rho], lb, ub)
+    sol = least_squares(resid, x0, bounds=(lb, ub), xtol=1e-8, ftol=1e-10,
+                        diff_step=1e-4, max_nfev=max_nfev)
+    if verbose:
+        print(f"    done: {n_eval[0]} evals, status {sol.status} ({sol.message.strip()})")
+    return HestonParams(*sol.x)
+
+
+def surface_rmse_bp(chain, S, r, q, p: HestonParams) -> float:
+    """Model-vs-market RMSE in implied-vol basis points (for reporting, not fitting)."""
+    err = []
+    for T, g in chain.groupby("T"):
+        px = price(S, g["K"].values, T, r, q, p, cp=g["cp"].values)
+        iv = bs.implied_vol(px, S, g["K"].values, T, r, q, g["cp"].values)
+        err.append(iv - g["iv"].values)
+    err = np.concatenate(err)
+    return float(np.sqrt(np.nanmean(err**2)) * 1e4)
 
 
 def min_variance_delta(S, K, T, r, q, p: HestonParams, cp=1, dS=1e-3):
