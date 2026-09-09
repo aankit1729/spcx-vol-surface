@@ -46,16 +46,24 @@ def _g(k, p: SVIParams):
     return (1 - k * w1 / (2 * w)) ** 2 - (w1**2 / 4) * (1 / w + 0.25) + w2 / 2
 
 
-def butterfly_arbitrage_free(p: SVIParams, k_grid=None) -> bool:
+def butterfly_arbitrage_free(p: SVIParams, k_range=None, k_grid=None) -> bool:
+    """Check Durrleman's condition, by default only where there is data.
+
+    Testing an SVI fit far outside the observed strike range grades it on pure
+    extrapolation, which says nothing about whether the market is arbitrage-free.
+    Pass k_range=(k_min, k_max) from the slice being fitted.
+    """
     if k_grid is None:
-        k_grid = np.linspace(-1.5, 1.5, 601)
+        lo, hi = k_range if k_range is not None else (-1.5, 1.5)
+        k_grid = np.linspace(lo, hi, 601)
     return bool(np.all(_g(k_grid, p) >= -1e-10))
 
 
-def calendar_arbitrage_free(p_short: SVIParams, p_long: SVIParams, k_grid=None) -> bool:
-    """Total variance must be non-decreasing in T for every k."""
+def calendar_arbitrage_free(p_short: SVIParams, p_long: SVIParams, k_range=None, k_grid=None) -> bool:
+    """Total variance must be non-decreasing in T, over the overlapping data range."""
     if k_grid is None:
-        k_grid = np.linspace(-1.5, 1.5, 601)
+        lo, hi = k_range if k_range is not None else (-1.5, 1.5)
+        k_grid = np.linspace(lo, hi, 601)
     return bool(np.all(total_variance(k_grid, p_long) >= total_variance(k_grid, p_short) - 1e-10))
 
 
@@ -104,5 +112,11 @@ def fit_slice(k, iv, T, weights=None, penalise_butterfly=True) -> SVIParams:
     return unpack(res.x if res.fun < best.fun else best.x)
 
 
-def rmse_iv(k, iv, T, p: SVIParams) -> float:
-    return float(np.sqrt(np.mean((implied_vol(k, T, p) - iv) ** 2)))
+def rmse_iv(k, iv, T, p: SVIParams, weights=None) -> float:
+    """RMSE in vol. Pass the same weights used to fit, otherwise the score is
+    dominated by wing quotes the fit was deliberately told to ignore."""
+    err = implied_vol(k, T, p) - iv
+    if weights is None:
+        return float(np.sqrt(np.mean(err ** 2)))
+    w = np.asarray(weights, dtype=float); w = w / w.sum()
+    return float(np.sqrt(np.sum(w * err ** 2)))
