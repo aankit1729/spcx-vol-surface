@@ -1,7 +1,13 @@
-"""Daily snapshot of option chains -> data/raw/<TICKER>/<YYYY-MM-DD>.parquet
+"""Snapshot of option chains -> data/raw/<TICKER>/<YYYY-MM-DD>T<HHMM>Z.parquet
 
 Run once per trading day after the close (cron / GitHub Actions). yfinance
 gives the *current* chain only, so history is whatever you accumulate.
+
+Files are named by the UTC time they were taken, to the minute, so no run can
+overwrite another. (They used to be named by UTC date alone; a scheduled job
+that slipped past midnight UTC then shared a name with the next evening's run
+and was overwritten by it.) Which trading session a file belongs to is worked
+out from its contents when it is read, not from its name.
 
     python scripts/snapshot.py SPCX SPY QQQ
 """
@@ -44,12 +50,12 @@ def snapshot(ticker: str) -> pd.DataFrame:
 
 
 def main(tickers):
-    day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H%MZ")
     for t in tickers:
         df = snapshot(t)
         dest = RAW / t
         dest.mkdir(parents=True, exist_ok=True)
-        path = dest / f"{day}.parquet"
+        path = dest / f"{stamp}.parquet"
         df.to_parquet(path, index=False)
         print(f"{t}: {len(df):6d} contracts, {df['expiry'].nunique():3d} expiries -> {path}")
 
