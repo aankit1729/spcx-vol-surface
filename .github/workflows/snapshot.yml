@@ -16,11 +16,14 @@ jobs:
         with: { python-version: "3.11" }
       - run: pip install -e .
       - run: python scripts/snapshot.py SPCX SPY QQQ
+      - name: Fit surfaces for new sessions
+        continue-on-error: true      # a fitting problem must never cost a day of raw data
+        run: python scripts/build_surfaces.py SPCX SPY QQQ
       - name: Commit snapshots
         run: |
           git config user.name "snapshot-bot"
           git config user.email "bot@users.noreply.github.com"
-          git add data/raw
+          git add data/raw data/surfaces
           if git diff --staged --quiet; then
             echo "No new data to commit."
           else
