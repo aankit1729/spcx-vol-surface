@@ -14,6 +14,8 @@ Filters, in order:
   7. OTM only (calls above F, puts below): liquid, and avoids early exercise
   8. standardised moneyness |k| / (sigma*sqrt(T)) cap - a fixed log-moneyness
      band is wrong, since the same k is far deeper OTM at 2 days than at 2 years
+  9. off-smile quotes - a tight, two-sided quote can still be weeks stale; it
+     shows up as an isolated spike against its neighbouring strikes
 """
 from __future__ import annotations
 
@@ -38,10 +40,58 @@ def session_date(snapshot_utc) -> pd.Timestamp:
     return pd.Timestamp(ts.tz_convert("America/New_York").date())
 
 
+def infer_session(raw: pd.DataFrame) -> pd.Timestamp:
+    """The trading session a chain belongs to, read from the chain itself.
+
+    The most recent trade anywhere in the chain dates the session, whatever time
+    the snapshot was taken. A job that runs on a market holiday or a Saturday
+    then correctly reports the previous session instead of a day with no trading.
+    Falls back to the snapshot timestamp if the chain has no trade times.
+    """
+    by_clock = session_date(raw["snapshot_utc"].iloc[0])
+    if "lastTradeDate" not in raw or raw["lastTradeDate"].isna().all():
+        return by_clock
+    last = pd.to_datetime(raw["lastTradeDate"], utc=True).max()
+    by_trades = pd.Timestamp(last.tz_convert("America/New_York").date())
+    return min(by_trades, by_clock)
+
+
+def _off_smile(k: np.ndarray, iv: np.ndarray, window: int = 3, n_sigmas: float = 5.0,
+               min_rel: float = 0.03) -> np.ndarray:
+    """Flag quotes that sit away from their neighbours in strike.
+
+    Each interior quote is compared with the vol its neighbours predict for it:
+    the median of the straight lines drawn between every quote within `window`
+    places on its left and every one on its right. Interpolating rather than
+    taking a plain median matters on a sloped smile, where the slope itself
+    would otherwise read as scatter and hide the outliers. A quote is flagged
+    when it misses that prediction by more than `n_sigmas` robust standard
+    deviations of the slice and by more than `min_rel` of the vol level.
+
+    The `window` quotes at either end are never flagged: with neighbours on one
+    side only there is nothing to interpolate between.
+    """
+    n = len(iv)
+    dev = np.zeros(n)
+    pred = np.ones(n)
+    for i in range(window, n - window):
+        kl, vl = k[i - window:i][:, None], iv[i - window:i][:, None]
+        kr, vr = k[i + 1:i + window + 1][None, :], iv[i + 1:i + window + 1][None, :]
+        lines = vl + (vr - vl) * (k[i] - kl) / (kr - kl)
+        pred[i] = np.median(lines)
+        dev[i] = iv[i] - pred[i]
+    inner = dev[window:n - window]
+    if inner.size == 0:
+        return np.zeros(n, dtype=bool)
+    sigma = 1.4826 * np.median(np.abs(inner - np.median(inner)))
+    return np.abs(dev) > np.maximum(n_sigmas * sigma, min_rel * pred)
+
+
 def clean_chain(raw: pd.DataFrame, r: float, q: float = 0.0,
                 max_rel_spread: float = 0.25, min_mid: float = 0.10,
                 min_bid: float = 0.05, min_oi: int = 10, min_T_days: float = 1.0,
-                max_z: float = 3.0, report: bool = False):
+                max_z: float = 3.0, drop_stale: bool = True, session=None,
+                report: bool = False):
     df = raw.copy()
     n0 = len(df)
     drops = {}
@@ -60,7 +110,7 @@ def clean_chain(raw: pd.DataFrame, r: float, q: float = 0.0,
     vol = df["volume"].fillna(0) if "volume" in df else pd.Series(0, index=df.index)
     n = len(df); df = df[(oi >= min_oi) | (vol > 0)]; note("illiquid", n)
 
-    sess = session_date(df["snapshot_utc"].iloc[0])
+    sess = pd.Timestamp(session) if session is not None else infer_session(raw)
     expiry_close = pd.to_datetime(df["expiry"]).dt.normalize() + pd.Timedelta(hours=_CLOSE_UTC_HOUR)
     session_close = sess + pd.Timedelta(hours=_CLOSE_UTC_HOUR)
     df["T"] = (expiry_close - session_close).dt.total_seconds() / (365.25 * 24 * 3600)
@@ -98,6 +148,14 @@ def clean_chain(raw: pd.DataFrame, r: float, q: float = 0.0,
     df["atm_iv"] = df["T"].map(atm)
     df["z"] = df["k"] / (df["atm_iv"] * np.sqrt(df["T"]))
     n = len(df); df = df[df["z"].abs() <= max_z]; note("beyond wing cutoff", n)
+
+    n = len(df)
+    if drop_stale and len(df):
+        df = df.sort_values(["T", "strike"])
+        stale = np.concatenate([_off_smile(g["k"].values, g["iv"].values)
+                                for _, g in df.groupby("T")])
+        df = df[~stale]
+    note("off-smile (stale)", n)
 
     # vega is the natural fitting weight: it is the sensitivity the fit should care about
     df["vega"] = bs.vega(df["S_fwd"].values, df["strike"].values, df["T"].values, r, 0.0, df["iv"].values)
